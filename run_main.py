@@ -131,11 +131,17 @@ use_cuda = torch.cuda.is_available()
 if use_mps:
     # avoid multiprocessing dataloader issues on macOS
     args.num_workers = 0
+
+# Determine mixed precision setting for Accelerator
+mixed_precision_setting = None
+if args.use_amp and use_cuda:
+    mixed_precision_setting = 'fp16'  # or 'bf16' if supported
+
 if args.use_deepspeed and use_cuda and not use_mps:
     deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
-    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
+    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin, mixed_precision=mixed_precision_setting)
 else:
-    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs], mixed_precision=mixed_precision_setting)
 
 for ii in range(args.itr):
     # setting record of experiments
@@ -242,8 +248,8 @@ for ii in range(args.itr):
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
         train_loader, vali_loader, test_loader, model, model_optim, scheduler)
 
-    if args.use_amp:
-        scaler = torch.cuda.amp.GradScaler()
+    # Note: GradScaler is handled by Accelerator when mixed_precision is set
+    # No need for manual scaler
 
     for epoch in range(args.train_epochs):
         iter_count = 0
@@ -266,32 +272,8 @@ for ii in range(args.itr):
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
                 accelerator.device)
 
-            # encoder - decoder
-            if args.use_amp:
-                with torch.cuda.amp.autocast():
-                    if args.output_attention:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                    else:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                    f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
-                    if args.multi_task and outputs.shape[-1] >= 2:
-                        mem_pred, cls_pred = outputs[:, :, 0], outputs[:, :, 1]
-                        mem_true, cls_true = batch_y[:, :, 0], batch_y[:, :, 1]
-                        fail_ratio = cls_true.mean().item()
-                        if fail_ratio == 0 or fail_ratio == 1:
-                            pos_weight = torch.tensor([1.0], device=cls_pred.device)
-                        else:
-                            pos_weight = torch.tensor([(1 - fail_ratio) / fail_ratio], device=cls_pred.device)
-                        loss_reg = criterion(mem_pred, mem_true)
-                        loss_cls = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(cls_pred, cls_true)
-                        loss = loss_reg + args.cls_loss_weight * loss_cls
-                    else:
-                        loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
-            else:
+            # encoder - decoder (Accelerator handles mixed precision automatically)
+            with accelerator.autocast():
                 if args.output_attention:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                 else:
@@ -299,7 +281,7 @@ for ii in range(args.itr):
 
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
                 if args.multi_task and outputs.shape[-1] >= 2:
                     mem_pred, cls_pred = outputs[:, :, 0], outputs[:, :, 1]
                     mem_true, cls_true = batch_y[:, :, 0], batch_y[:, :, 1]
@@ -313,28 +295,24 @@ for ii in range(args.itr):
                     loss = loss_reg + args.cls_loss_weight * loss_cls
                 else:
                     loss = criterion(outputs, batch_y)
-                train_loss.append(loss.item())
+            train_loss.append(loss.item())
 
-                if (i + 1) % 100 == 0:
-                    accelerator.print(
-                        "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
-                    accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
-                    
-                    # Clear GPU cache every 100 iterations to prevent memory fragmentation
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+            if (i + 1) % 100 == 0:
+                accelerator.print(
+                    "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                speed = (time.time() - time_now) / iter_count
+                left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
+                accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                iter_count = 0
+                time_now = time.time()
+                
+                # Clear GPU cache every 100 iterations to prevent memory fragmentation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            if args.use_amp:
-                scaler.scale(loss).backward()
-                scaler.step(model_optim)
-                scaler.update()
-            else:
-                accelerator.backward(loss)
-                model_optim.step()
+            # Accelerator handles gradient scaling automatically with mixed_precision
+            accelerator.backward(loss)
+            model_optim.step()
 
             if args.lradj == 'TST':
                 adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=False)

@@ -8,7 +8,7 @@
 #SBATCH --partition=batch_ce_ugrad
 
 # 작업 디렉토리
-cd /data/myeunee/graduation_proj/Time-LLM
+cd /data/myeunee/graduation_proj/failure-detection-by-TimeLLM
 
 # Conda 환경 활성화
 source ~/.bashrc

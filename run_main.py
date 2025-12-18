@@ -18,7 +18,7 @@ import os
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
-from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content, save_example_plot
+from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -125,23 +125,13 @@ parser.add_argument('--use_deepspeed', action='store_true', default=False,
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-# Configure accelerator: avoid DeepSpeed on CPU/MPS; enable only if explicitly requested and CUDA is available
+# Configure accelerator
 use_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-use_cuda = torch.cuda.is_available()
 if use_mps:
     # avoid multiprocessing dataloader issues on macOS
     args.num_workers = 0
 
-# Determine mixed precision setting for Accelerator
-mixed_precision_setting = None
-if args.use_amp and use_cuda:
-    mixed_precision_setting = 'fp16'  # or 'bf16' if supported
-
-if args.use_deepspeed and use_cuda and not use_mps:
-    deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
-    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin, mixed_precision=mixed_precision_setting)
-else:
-    accelerator = Accelerator(device_placement=False, kwargs_handlers=[ddp_kwargs], mixed_precision=mixed_precision_setting)
+accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
 for ii in range(args.itr):
     # setting record of experiments
@@ -248,8 +238,6 @@ for ii in range(args.itr):
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
         train_loader, vali_loader, test_loader, model, model_optim, scheduler)
 
-    # Note: GradScaler is handled by Accelerator when mixed_precision is set
-    # No need for manual scaler
 
     for epoch in range(args.train_epochs):
         iter_count = 0
@@ -320,16 +308,16 @@ for ii in range(args.itr):
 
         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
-        vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
-        accelerator.print(
-            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
+        vali_out = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
+        test_out = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        vali_loss, vali_mae_loss = vali_out[0], vali_out[1]
+        test_loss, test_mae_loss = test_out[0], test_out[1]
+        if args.multi_task and len(vali_out) > 2 and vali_out[2] is not None:
+            accelerator.print("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE: {4:.7f} | V-ACC: {5:.4f} T-ACC: {6:.4f}".format(
+                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss, vali_out[2], test_out[2]))
+        else:
+            accelerator.print("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                 epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
-
-        # save a small example plot on main process
-        if accelerator.is_local_main_process and (epoch == args.train_epochs - 1 or epoch % 1 == 0):
-            fig_dir = os.path.join(path, 'figs')
-            save_example_plot(args, accelerator, model, test_loader, os.path.join(fig_dir, f'epoch_{epoch+1}.png'))
 
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:

@@ -6,6 +6,7 @@
 #SBATCH --mem-per-gpu=32G
 #SBATCH --time 1-0
 #SBATCH --partition=batch_ce_ugrad
+#SBATCH -w moana-r4
 
 # 작업 디렉토리
 cd /data/myeunee/graduation_proj/failure-detection-by-TimeLLM

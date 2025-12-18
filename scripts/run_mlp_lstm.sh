@@ -1,21 +1,37 @@
 #!/bin/bash
 
+#SBATCH --job-name=timellm_mlp_lstm
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem-per-gpu=32G
+#SBATCH --time 1-0
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH -w moana-r5
+
+# 작업 디렉토리
+cd /data/myeunee/graduation_proj/failure-detection-by-TimeLLM
+
+# Conda 환경 활성화
+source ~/.bashrc
+conda activate /data/myeunee/timellm
+
+# Hugging Face 캐시 디렉토리를 /data로 강제 설정 (공간 부족 문제 해결)
+export HF_HOME=/data/myeunee/.cache/huggingface
+export TRANSFORMERS_CACHE=/data/myeunee/.cache/huggingface
+export HF_DATASETS_CACHE=/data/myeunee/.cache/huggingface
+mkdir -p $HF_HOME
+
 set -e
 
-# trace 데이터로 baseline vs MLP+LSTM 비교
+# trace 데이터로 MLP+LSTM 실행
 
 MODEL=TimeLLM
-COMMENT_NONE="compare-trace-none"
 COMMENT_MLPLSTM="compare-trace-mlplstm"
 
 # 데이터셋: trace
 DATASET=${1:-trace}
 DATAPATH=${2:-trace.csv}
 
-# trace.csv: Dataset_Trace 사용
-# 두 타겟 변수: avg_usage_memory (regression), fail_in_window (classification)
-# enc_in=2 (use_covariates=False일 때)
-# 인스턴스 기반 분할 사용
 COMMON_ARGS_BASE="--task_name long_term_forecast \
   --is_training 1 \
   --root_path ./dataset/ \
@@ -53,12 +69,9 @@ COMMON_ARGS_BASE="--task_name long_term_forecast \
   --train_epochs 15"
 
 echo "========================================="
-echo "[${DATASET}] Baseline (none)"
+echo "[${DATASET}] With MLP+LSTM"
 echo "========================================="
-python3 run_main.py $COMMON_ARGS_BASE --model_comment $COMMENT_NONE --extra_head none
+python3 run_main.py $COMMON_ARGS_BASE --model_comment $COMMENT_MLPLSTM --extra_head mlp_lstm
 
-#echo ""
-#echo "========================================="
-#echo "[${DATASET}] With MLP+LSTM"
-#echo "========================================="
-#python3 run_main.py $COMMON_ARGS_BASE --model_comment $COMMENT_MLPLSTM --extra_head mlp_lstm
+
+

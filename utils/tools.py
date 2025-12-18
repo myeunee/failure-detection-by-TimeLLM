@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch import nn
 import matplotlib.pyplot as plt
 import shutil
 
@@ -137,57 +138,56 @@ def del_files(dir_path):
 def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric):
     total_loss = []
     total_mae_loss = []
+    total_correct = 0
+    total_count = 0
     model.eval()
+    bce = nn.BCEWithLogitsLoss()
     with torch.no_grad():
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float()
-
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
 
-            # decoder input
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
-                accelerator.device)
-            # encoder - decoder (Accelerator handles mixed precision automatically)
-            with accelerator.autocast():
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(accelerator.device)
+
+            if args.use_amp:
+                with torch.cuda.amp.autocast():
+                    if args.output_attention:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            else:
                 if args.output_attention:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                 else:
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-            outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
-
+            # Skip gather_for_metrics - causes SIGSEGV on single GPU
+            # outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
+            batch_y = batch_y.to(accelerator.device)
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+            batch_y = batch_y[:, -args.pred_len:, f_dim:]
 
-            pred = outputs.detach()
-            true = batch_y.detach()
-
-            # Apply multi-task loss if enabled (same as training)
-            if hasattr(args, 'multi_task') and args.multi_task and outputs.shape[-1] >= 2:
-                mem_pred = pred[:, :, 0]
-                mem_true = true[:, :, 0]
-                cls_pred = pred[:, :, 1]
-                cls_true = true[:, :, 1]
+            if args.multi_task and outputs.shape[-1] >= 2:
+                mem_pred = outputs[:, :, 0]
+                mem_true = batch_y[:, :, 0]
+                cls_pred = outputs[:, :, 1]
+                cls_true = batch_y[:, :, 1]
                 loss_reg = criterion(mem_pred, mem_true)
-                
-                # Calculate fail ratio for pos_weight
-                fail_ratio = cls_true.mean().item()
-                if fail_ratio == 0 or fail_ratio == 1:
-                    pos_weight = torch.tensor([1.0]).to(cls_pred.device)
-                else:
-                    pos_weight = torch.tensor([(1 - fail_ratio) / fail_ratio]).to(cls_pred.device)
-                
-                import torch.nn as nn
-                loss_cls = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(cls_pred, cls_true)
+                loss_cls = bce(cls_pred, cls_true)
                 loss = loss_reg + args.cls_loss_weight * loss_cls
-                
-                # MAE only on regression (memory) channel
                 mae_loss = mae_metric(mem_pred, mem_true)
+                # accuracy with 0.5 threshold
+                cls_prob = torch.sigmoid(cls_pred)
+                cls_hat = (cls_prob >= 0.5).float()
+                total_correct += (cls_hat == cls_true).sum().item()
+                total_count += cls_true.numel()
             else:
+                pred = outputs.detach()
+                true = batch_y.detach()
                 loss = criterion(pred, true)
                 mae_loss = mae_metric(pred, true)
 
@@ -196,8 +196,10 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
 
     total_loss = np.average(total_loss)
     total_mae_loss = np.average(total_mae_loss)
-
     model.train()
+    if args.multi_task and total_count > 0:
+        acc = total_correct / total_count
+        return total_loss, total_mae_loss, acc
     return total_loss, total_mae_loss
 
 

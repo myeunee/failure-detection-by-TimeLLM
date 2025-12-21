@@ -25,8 +25,3 @@ Input → Patching → LSTM → Skip Connection → MLP → LLM → Output
 
 - [Time-LLM (ICLR 2024)](https://openreview.net/forum?id=Unb5CVPtae)
 - [Google Cluster Trace v3](https://github.com/google/cluster-data)
-
-## 👤 Author
-
-**Yoonji Heo**  
-Computer Engineering, Kyung Hee University
